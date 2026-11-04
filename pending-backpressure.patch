@@ -25,9 +25,7 @@
  	enum peer_state			 state;
  	enum export_type		 export_type;
  	enum role			 role;
-@@ -431,6 +442,7 @@
- void		 rde_enqueue_updates(struct rib_entry *, struct rde_peer *,
- 		    struct prefix *, uint32_t, enum eval_mode);
+@@ -433,4 +444,5 @@
  void		 peer_process_updates(struct rde_peer *, void *);
 +int		 peer_pending_throttled(void *);
  
@@ -51,8 +49,7 @@
  
  CTASSERT(sizeof(peerself->recv_eor) * 8 >= AID_MAX);
  CTASSERT(sizeof(peerself->sent_eor) * 8 >= AID_MAX);
-@@ -332,11 +334,21 @@
- 		re->pq_mode = mode;
+@@ -333,7 +335,13 @@
  }
  
 +int
@@ -66,6 +63,7 @@
  {
  	struct rib_entry *re;
  	struct rde_peer *p;
+@@ -340,3 +348,7 @@
 +
 +	/* Leave the RIB work queued; never discard an UPDATE or withdraw. */
 +	if (peer_pending_throttled(NULL))
@@ -73,16 +71,30 @@
  
  	re = TAILQ_FIRST(&peer->rib_pq_head);
  	if (re == NULL)
-@@ -633,7 +645,7 @@
+@@ -628,12 +640,21 @@
+ void
+ peer_blast(struct rde_peer *peer, uint8_t aid)
+ {
++	int (*throttled)(void *) = peer_pending_throttled;
++
++#ifdef OPENBGPD_PENDING_LEGACY_DUMP
++	/* Legacy initial blasts must finish before their peer can send. */
++	if (peer->export_type == EXPORT_NONE ||
++	    peer->export_type == EXPORT_DEFAULT_ROUTE)
++		throttled = NULL;
++#endif
++
+ 	if (peer->capa.enhanced_rr && (peer->sent_eor & (1 << aid)))
+ 		rde_peer_send_rrefresh(peer, aid, ROUTE_REFRESH_BEGIN_RR);
  
  	/* force out all updates from the Adj-RIB-Out */
  	if (adjout_prefix_dump_new(peer, aid, RDE_RUNNER_ROUNDS, peer,
 -	    peer_blast_upcall, peer_blast_done, NULL) == -1)
-+	    peer_blast_upcall, peer_blast_done, peer_pending_throttled) == -1)
++	    peer_blast_upcall, peer_blast_done, throttled) == -1)
  		fatal("%s: adjout_prefix_dump_new", __func__);
  }
  
-@@ -655,7 +667,53 @@
+@@ -655,7 +676,53 @@
  static void
  peer_dump_done(void *ptr, uint8_t aid)
  {
@@ -136,18 +148,28 @@
  }
  
  /*
-@@ -666,6 +724,10 @@
+@@ -666,6 +733,20 @@
  void
  peer_dump(struct rde_peer *peer, uint8_t aid)
  {
-+	if (peer->dump_count == UINT_MAX)
-+		fatalx("%s: too many dumps", __func__);
-+	peer->dump_count++;
++#ifdef OPENBGPD_PENDING_LEGACY_DUMP
++	/* These exports complete via peer_blast_done(), not peer_dump_done(). */
++	const int track = peer->export_type != EXPORT_NONE &&
++	    peer->export_type != EXPORT_DEFAULT_ROUTE;
++#else
++	const int track = 1;
++#endif
++
++	if (track) {
++		if (peer->dump_count == UINT_MAX)
++			fatalx("%s: too many dumps", __func__);
++		peer->dump_count++;
++	}
 +
  	/* throttle peer until dump is done */
  	peer->throttled = 1;
  
-@@ -679,7 +741,7 @@
+@@ -679,7 +760,7 @@
  		    peer_dump_done);
  	} else {
  		if (rib_dump_new(peer->loc_rib_id, aid, RDE_RUNNER_ROUNDS, peer,
@@ -156,7 +178,7 @@
  			fatal("%s: rib_dump_new", __func__);
  	}
  }
-@@ -722,7 +784,8 @@
+@@ -722,7 +803,8 @@
  	RB_FOREACH(p, peer_tree, &peertable) {
  		if (ibufq_queuelen(p->ibufq) != 0)
  			return 1;

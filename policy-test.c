@@ -67,14 +67,34 @@ ibufq_queuelen(struct ibufqueue *queue)
     return inbound[id];
 }
 
+static void
+record_generation(void)
+{
+    generated++;
+    if (increase_pending) rdemem.pend_prefix_cnt++;
+}
+
+#ifdef OPENBGPD_POLICY_LEGACY_UPDATES
+void
+up_generate_updates(struct rde_peer *peer, struct rib_entry *re)
+{
+    (void)peer; (void)re;
+    record_generation();
+}
+
+void
+up_generate_addpath(struct rde_peer *peer, struct rib_entry *re)
+{
+    up_generate_updates(peer, re);
+}
+#else
 void
 up_generate_updates(struct rde_peer *peer, struct rib_entry *re,
     enum eval_mode mode)
 {
     (void)peer; (void)re;
     CHECK(mode == EVAL_DEFAULT || mode == EVAL_SYNC || mode == EVAL_REEVAL);
-    generated++;
-    if (increase_pending) rdemem.pend_prefix_cnt++;
+    record_generation();
 }
 
 void
@@ -90,16 +110,23 @@ up_generate_addpath_all(struct rde_peer *peer, struct rib_entry *re,
 {
     up_generate_updates(peer, re, mode);
 }
+#endif
 
+#ifndef OPENBGPD_POLICY_LEGACY_UPDATES
 void
 adjout_prefix_collect(struct pt_entry *prefix)
 {
     CHECK(prefix != NULL);
     collected++;
 }
+#endif
 
 void
+#ifdef OPENBGPD_POLICY_LEGACY_UPDATES
+rib_dequeue(struct rib_entry *re)
+#else
 rib_pq_dequeue(struct rib_entry *re)
+#endif
 {
     last_dequeued = re;
     dequeued++;
@@ -124,10 +151,18 @@ rib_dump_new(uint16_t ribid, uint8_t aid, unsigned int count, void *arg,
     return 0;
 }
 
+#ifdef OPENBGPD_POLICY_LEGACY_UPDATES
+typedef void (*adjout_upcall)(struct rde_peer *, struct pt_entry *,
+    struct adjout_prefix *, void *);
+#else
+typedef void (*adjout_upcall)(struct pt_entry *, struct adjout_prefix *,
+    uint32_t, void *);
+#endif
+
 int
 adjout_prefix_dump_new(struct rde_peer *peer, uint8_t aid, unsigned int count,
-    void *arg, void (*upcall)(struct pt_entry *, struct adjout_prefix *,
-    uint32_t, void *), void (*done)(void *, uint8_t), int (*throttled)(void *))
+    void *arg, adjout_upcall upcall, void (*done)(void *, uint8_t),
+    int (*throttled)(void *))
 {
     (void)peer; (void)aid; (void)arg; (void)upcall;
     CHECK(count == RDE_RUNNER_ROUNDS);
@@ -219,18 +254,29 @@ test_queue_retention_and_boundary(void)
     memset(&re, 0, sizeof(re));
     re.prefix = &prefix; re.rib_id = RIB_LOC_START; re.pq_mode = EVAL_DEFAULT;
     TAILQ_INSERT_TAIL(&a.rib_pq_head, &re, rib_queue);
+#ifndef OPENBGPD_POLICY_NO_RIB_COUNTERS
     a.stats.rib_entry_count = 1; rdemem.rde_rib_entry_count = 1;
+#endif
     peer_process_updates(&a, NULL);
     CHECK(TAILQ_FIRST(&a.rib_pq_head) == &re);
+#ifndef OPENBGPD_POLICY_NO_RIB_COUNTERS
     CHECK(a.stats.rib_entry_count == 1 && rdemem.rde_rib_entry_count == 1);
+#endif
     CHECK(generated == 0 && collected == 0 && dequeued == 0);
     CHECK(!peer_work_pending());
     rdemem.pend_prefix_cnt = 99; increase_pending = 1;
     CHECK(peer_work_pending());
     peer_process_updates(&a, NULL);
     CHECK(TAILQ_EMPTY(&a.rib_pq_head));
+#ifndef OPENBGPD_POLICY_NO_RIB_COUNTERS
     CHECK(a.stats.rib_entry_count == 0 && rdemem.rde_rib_entry_count == 0);
-    CHECK(generated == 2 && collected == 1 && dequeued == 1 && last_dequeued == &re);
+#endif
+#ifdef OPENBGPD_POLICY_LEGACY_UPDATES
+    CHECK(collected == 0);
+#else
+    CHECK(collected == 1);
+#endif
+    CHECK(generated == 2 && dequeued == 1 && last_dequeued == &re);
     /* The complete fan-out is preserved: the mark is deliberately soft. */
     CHECK(rdemem.pend_prefix_cnt == 101);
     puts("PASS: production boundary, queued-work retention/resume, complete fan-out soft overshoot");
@@ -364,9 +410,21 @@ test_busy_poll_and_eor(void)
     a.capa.grestart.restart = 1; a.throttled = 1;
     peer_blast_done(&a, AID_INET6); CHECK(a.throttled == 0 && eors == 1);
     a.export_type = EXPORT_NONE; peer_dump(&a, AID_INET);
+#ifdef OPENBGPD_POLICY_LEGACY_UPDATES
+    /* These versions finish special exports through an Adj-RIB-Out walk. */
+    CHECK(a.throttled && eors == 1 && blast_done != NULL);
+    CHECK(blast_throttled == NULL);
+    blast_done(&a, AID_INET);
+#endif
     CHECK(a.dump_count == 0 && eors == 2);
     a.export_type = EXPORT_DEFAULT_ROUTE; peer_dump(&a, AID_INET6);
+#ifdef OPENBGPD_POLICY_LEGACY_UPDATES
+    CHECK(a.throttled && eors == 2 && blast_done != NULL);
+    CHECK(blast_throttled == NULL);
+    blast_done(&a, AID_INET6);
+#endif
     CHECK(a.dump_count == 0 && defaults == 1 && eors == 3);
+    a.export_type = EXPORT_UNSET;
     peer_blast(&a, AID_INET);
     CHECK(blast_throttled != NULL && blast_done != NULL);
     rdemem.pend_prefix_cnt = 100; CHECK(blast_throttled(&a));
