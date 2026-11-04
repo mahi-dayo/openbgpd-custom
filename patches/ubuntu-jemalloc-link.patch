@@ -1,0 +1,22 @@
+--- a/src/bgpd/Makefile.am
++++ b/src/bgpd/Makefile.am
+@@ -30,7 +30,7 @@
+ bgpd_CFLAGS += -DSYSCONFDIR=\"$(sysconfdir)\"
+ bgpd_CFLAGS += -DRUNSTATEDIR=\"$(runstatedir)\"
+ 
+-bgpd_LDADD = $(PLATFORM_LDADD) $(PROG_LDADD) -lutil
++bgpd_LDADD = -ljemalloc $(PLATFORM_LDADD) $(PROG_LDADD) -lutil
+ bgpd_LDADD += $(top_builddir)/compat/libcompat.la
+ bgpd_LDADD += $(top_builddir)/compat/libcompatnoopt.la
+ 
+--- a/src/bgpd/Makefile.in
++++ b/src/bgpd/Makefile.in
+@@ -447,7 +447,7 @@
+ EXTRA_DIST = bgpd.8.in bgpd.conf.5.in
+ bgpd_CFLAGS = $(AM_CFLAGS) -DSYSCONFDIR=\"$(sysconfdir)\" \
+ 	-DRUNSTATEDIR=\"$(runstatedir)\"
+-bgpd_LDADD = $(PLATFORM_LDADD) $(PROG_LDADD) -lutil \
++bgpd_LDADD = -ljemalloc $(PLATFORM_LDADD) $(PROG_LDADD) -lutil \
+ 	$(top_builddir)/compat/libcompat.la \
+ 	$(top_builddir)/compat/libcompatnoopt.la
+ bgpd_SOURCES = bgpd.c bgpd_imsg.c bitmap.c chash.c session.c \

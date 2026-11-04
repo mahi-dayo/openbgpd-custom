@@ -1,0 +1,197 @@
+--- a/src/bgpd/rde.h
++++ b/src/bgpd/rde.h
+@@ -28,6 +28,15 @@
+ #include "bgpd.h"
+ #include "chash.h"
+ #include "log.h"
++
++/* Soft water mark, not a byte limit; finish admitted dumps before pausing. */
++#ifndef RDE_PENDING_LIMIT
++#define RDE_PENDING_LIMIT 20000000LL
++#endif
++#if RDE_PENDING_LIMIT <= 0
++#error RDE_PENDING_LIMIT must be positive
++#endif
++#define RDE_PENDING_DUMPS 64
+ 
+ /* rde internal structures */
+ 
+@@ -107,6 +116,8 @@
+ 	uint32_t			 remote_bgpid;
+ 	uint32_t			 path_id_tx;
+ 	unsigned int			 local_if_scope;
++	unsigned int			 dump_count;
++	unsigned int			 dump_admitted;
+ 	enum peer_state			 state;
+ 	enum export_type		 export_type;
+ 	enum role			 role;
+@@ -431,6 +442,7 @@
+ void		 rde_enqueue_updates(struct rib_entry *, struct rde_peer *,
+ 		    struct prefix *, uint32_t, enum eval_mode);
+ void		 peer_process_updates(struct rde_peer *, void *);
++int		 peer_pending_throttled(void *);
+ 
+ void		 peer_up(struct rde_peer *, struct session_up *);
+ void		 peer_down(struct rde_peer *);
+--- a/src/bgpd/rde_peer.c
++++ b/src/bgpd/rde_peer.c
+@@ -18,6 +18,7 @@
+ #include <sys/types.h>
+ #include <sys/queue.h>
+ 
++#include <limits.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -29,6 +30,7 @@
+ struct peer_tree	 peertable = RB_INITIALIZER(&peertable);
+ struct peer_tree	 zombietable = RB_INITIALIZER(&zombietable);
+ struct rde_peer		*peerself;
++static unsigned int	 dump_active;
+ 
+ CTASSERT(sizeof(peerself->recv_eor) * 8 >= AID_MAX);
+ CTASSERT(sizeof(peerself->sent_eor) * 8 >= AID_MAX);
+@@ -332,11 +334,21 @@
+ 		re->pq_mode = mode;
+ }
+ 
++int
++peer_pending_throttled(void *arg)
++{
++	return rdemem.pend_prefix_cnt >= RDE_PENDING_LIMIT;
++}
++
+ void
+ peer_process_updates(struct rde_peer *peer, void *bula)
+ {
+ 	struct rib_entry *re;
+ 	struct rde_peer *p;
++
++	/* Leave the RIB work queued; never discard an UPDATE or withdraw. */
++	if (peer_pending_throttled(NULL))
++		return;
+ 
+ 	re = TAILQ_FIRST(&peer->rib_pq_head);
+ 	if (re == NULL)
+@@ -633,7 +645,7 @@
+ 
+ 	/* force out all updates from the Adj-RIB-Out */
+ 	if (adjout_prefix_dump_new(peer, aid, RDE_RUNNER_ROUNDS, peer,
+-	    peer_blast_upcall, peer_blast_done, NULL) == -1)
++	    peer_blast_upcall, peer_blast_done, peer_pending_throttled) == -1)
+ 		fatal("%s: adjout_prefix_dump_new", __func__);
+ }
+ 
+@@ -655,7 +667,53 @@
+ static void
+ peer_dump_done(void *ptr, uint8_t aid)
+ {
++	struct rde_peer *peer = ptr;
++
++	if (peer->dump_count == 0)
++		fatalx("%s: unbalanced dump", __func__);
++	if (--peer->dump_count == 0 && peer->dump_admitted) {
++		if (dump_active == 0)
++			fatalx("%s: unbalanced admission", __func__);
++		dump_active--;
++		peer->dump_admitted = 0;
++	}
++
+ 	peer_blast_done(ptr, aid);
++}
++
++/*
++ * An admitted initial dump must finish: its peer cannot drain Pending until
++ * done. Bound concurrent dumps, retaining the RIB walker's batching. Under
++ * pressure, admit a batch only if no active dump or non-dumping peer can drain.
++ */
++static int
++peer_dump_throttled(void *arg)
++{
++	struct rde_peer *peer = arg, *p;
++
++	if (peer->dump_admitted)
++		return 0;
++	if (dump_active >= RDE_PENDING_DUMPS)
++		return 1;
++	if (peer_pending_throttled(NULL)) {
++		if (dump_active != 0)
++			return 1;
++		RB_FOREACH(p, peer_tree, &peertable) {
++			if (peer_is_up(p) && p->dump_count == 0 &&
++			    (p->stats.pending_update != 0 ||
++			    p->stats.pending_withdraw != 0))
++				return 1;
++		}
++	}
++	/* Reserve a batch before any walker can fill the Pending headroom. */
++	RB_FOREACH(p, peer_tree, &peertable) {
++		if (!peer_is_up(p) || p->dump_count == 0 || p->dump_admitted)
++			continue;
++		p->dump_admitted = 1;
++		if (++dump_active >= RDE_PENDING_DUMPS)
++			break;
++	}
++	return !peer->dump_admitted;
+ }
+ 
+ /*
+@@ -666,6 +724,10 @@
+ void
+ peer_dump(struct rde_peer *peer, uint8_t aid)
+ {
++	if (peer->dump_count == UINT_MAX)
++		fatalx("%s: too many dumps", __func__);
++	peer->dump_count++;
++
+ 	/* throttle peer until dump is done */
+ 	peer->throttled = 1;
+ 
+@@ -679,7 +741,7 @@
+ 		    peer_dump_done);
+ 	} else {
+ 		if (rib_dump_new(peer->loc_rib_id, aid, RDE_RUNNER_ROUNDS, peer,
+-		    peer_dump_upcall, peer_dump_done, NULL) == -1)
++		    peer_dump_upcall, peer_dump_done, peer_dump_throttled) == -1)
+ 			fatal("%s: rib_dump_new", __func__);
+ 	}
+ }
+@@ -722,7 +784,8 @@
+ 	RB_FOREACH(p, peer_tree, &peertable) {
+ 		if (ibufq_queuelen(p->ibufq) != 0)
+ 			return 1;
+-		if (!TAILQ_EMPTY(&p->rib_pq_head))
++		if (!TAILQ_EMPTY(&p->rib_pq_head) &&
++		    !peer_pending_throttled(NULL))
+ 			return 1;
+ 	}
+ 
+--- a/src/bgpd/rde.c
++++ b/src/bgpd/rde.c
+@@ -4038,7 +4038,7 @@
+ 		if (peer->reconf_rib) {
+ 			if (adjout_prefix_dump_new(peer, AID_UNSPEC,
+ 			    RDE_RUNNER_ROUNDS, peer, rde_up_flush_upcall,
+-			    rde_softreconfig_in_done, NULL) == -1)
++			    rde_softreconfig_in_done, peer_pending_throttled) == -1)
+ 				fatal("%s: prefix_dump_new", __func__);
+ 			log_peer_info(&peer->conf, "flushing Adj-RIB-Out");
+ 			softreconfig++;	/* account for the running flush */
+@@ -4090,7 +4090,7 @@
+ 					    AID_UNSPEC, RDE_RUNNER_ROUNDS, peer,
+ 					    rde_up_flush_upcall,
+ 					    rde_softreconfig_in_done,
+-					    NULL) == -1)
++					    peer_pending_throttled) == -1)
+ 						fatal("%s: prefix_dump_new",
+ 						    __func__);
+ 
+@@ -4281,7 +4281,7 @@
+ 		if (rib->state == RECONF_RELOAD) {
+ 			if (rib_dump_new(i, AID_UNSPEC, RDE_RUNNER_ROUNDS,
+ 			    rib, rde_softreconfig_out,
+-			    rde_softreconfig_out_done, NULL) == -1)
++			    rde_softreconfig_out_done, peer_pending_throttled) == -1)
+ 				fatal("%s: rib_dump_new", __func__);
+ 			softreconfig++;
+ 			log_info("starting softreconfig out for rib %s",

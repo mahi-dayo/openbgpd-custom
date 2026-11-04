@@ -1,0 +1,8 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.log
+*.tar.gz
+*.bundle
+rs-test.env
+upstream/openbgpd-*/
